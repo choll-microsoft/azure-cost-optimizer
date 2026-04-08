@@ -9,6 +9,7 @@ description = "Multi-agent Azure cost analysis and optimization tool powered by 
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
+    "openai>=1.50.0",
     "azure-identity>=1.17.0",
     "azure-mgmt-costmanagement>=4.0.0",
     "azure-mgmt-compute>=32.0.0",

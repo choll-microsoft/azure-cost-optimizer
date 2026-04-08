@@ -7,10 +7,17 @@ class Settings(BaseSettings):
     azure_client_id: str | None = None
     azure_client_secret: str | None = None
     azure_subscription_id: str
-    anthropic_api_key: str
+
+    # Azure OpenAI
+    azure_openai_endpoint: str = "https://spare-part-ai-oai-w3x7t3r7c5sji.openai.azure.com/"
+    azure_openai_deployment: str = "gpt-4o"
+    azure_openai_api_version: str = "2024-12-01-preview"
+
+    # Anthropic (optional fallback)
+    anthropic_api_key: str | None = None
+
     lookback_days: int = 30
     output_dir: str = "./outputs"
-    claude_model: str = "claude-sonnet-4-6"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

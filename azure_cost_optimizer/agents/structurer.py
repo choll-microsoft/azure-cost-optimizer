@@ -1,10 +1,9 @@
-"""Agent 2: Structures raw Azure data into a normalized report using Claude tool_use."""
+"""Agent 2: Structures raw Azure data into a normalized report using Azure OpenAI."""
 
 import json
 import uuid
 from datetime import datetime, timezone
 
-import anthropic
 from rich.console import Console
 
 from ..config import settings
@@ -16,37 +15,57 @@ from ..models.structured import (
     StructuredReport,
     UnderutilizedResource,
 )
+from ..openai_client import get_openai_client
 from ..tools.structurer_tools import STRUCTURER_TOOLS, handle_structurer_tool
 
 console = Console()
 
 SYSTEM_PROMPT = """You are an Azure cost analysis specialist. You have access to raw Azure \
 billing and resource data. Your job is to normalize and structure this data into a clean \
-report by calling the provided tools.
+report by calling the provided functions.
 
 Follow this sequence:
 1. Call aggregate_costs_by_service (top 20) to identify top spending services
 2. Call aggregate_costs_by_resource_group to understand cost distribution
-3. Call identify_underutilized_vms (CPU threshold: 10%) to find optimization targets
+3. Call identify_underutilized_vms (cpu_threshold_percent: 10) to find optimization targets
 4. Call identify_orphaned_resources to find waste
-5. Call get_advisor_cost_recommendations (min savings: $10) for Azure's own recommendations
+5. Call get_advisor_cost_recommendations (min_savings_usd: 10) for Azure's own recommendations
 6. Call get_vm_inventory_summary to compile the VM inventory
 7. Call finalize_structured_report with all gathered data assembled into a report dict
 
-Be thorough but concise. Focus on actionable data. When you call finalize_structured_report, \
-include all the data you have collected in the report dict."""
+Be thorough but concise. Focus on actionable data."""
+
+# Convert Anthropic-style tool defs → OpenAI function-calling format
+def _to_openai_tools(tools: list[dict]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in tools
+    ]
+
+
+OPENAI_TOOLS = _to_openai_tools(STRUCTURER_TOOLS)
 
 
 class StructurerAgent:
-    """Uses Claude with tool_use to normalize raw Azure data into a structured report."""
+    """Uses Azure OpenAI GPT-4o with function calling to normalize raw Azure data."""
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.claude_model
+        self.client = get_openai_client()
+        self.deployment = settings.azure_openai_deployment
 
     def structure(self, raw_data: RawAzureData) -> StructuredReport:
-        """Run the Claude tool_use loop until finalize_structured_report is called."""
-        console.print("[cyan]Structurer Agent:[/cyan] Starting analysis with Claude...")
+        """Run the function-calling loop until finalize_structured_report is called."""
+        console.print(
+            f"[cyan]Structurer Agent:[/cyan] Starting analysis with "
+            f"Azure OpenAI ({self.deployment})..."
+        )
 
         user_message = (
             f"Please structure the following Azure cost data into a normalized report.\n\n"
@@ -59,63 +78,66 @@ class StructurerAgent:
             f"Advisor recommendations available: {len(raw_data.advisor_recommendations)}\n"
             f"VM metric samples collected: {len(raw_data.vm_metrics)}\n"
             f"Potentially orphaned resources detected: {len(raw_data.orphaned_resource_ids)}\n\n"
-            "Please call the available tools to build the structured report."
+            "Please call the available functions to build the structured report."
         )
 
-        messages: list[dict] = [{"role": "user", "content": user_message}]
+        messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
         structured_report_data: dict | None = None
 
         while True:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                tools=STRUCTURER_TOOLS,
+            response = self.client.chat.completions.create(
+                model=self.deployment,
                 messages=messages,
+                tools=OPENAI_TOOLS,
+                tool_choice="auto",
+                max_tokens=8096,
+                temperature=0.1,
             )
 
-            messages.append({"role": "assistant", "content": response.content})
+            msg = response.choices[0].message
+            messages.append(msg)
 
-            if response.stop_reason == "end_turn":
-                console.print("[yellow]Structurer:[/yellow] Claude finished without calling finalize.")
+            finish_reason = response.choices[0].finish_reason
+
+            if finish_reason == "stop" or not msg.tool_calls:
+                console.print("[yellow]Structurer:[/yellow] Model finished without calling finalize.")
                 break
 
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        console.print(f"  [dim]→ Tool call: {block.name}[/dim]")
-                        if block.name == "finalize_structured_report":
-                            structured_report_data = block.input.get("report", {})
-                            tool_results.append(
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": json.dumps(
-                                        {
-                                            "status": "saved",
-                                            "report_id": structured_report_data.get("report_id"),
-                                        }
-                                    ),
-                                }
-                            )
-                        else:
-                            result = handle_structurer_tool(block.name, block.input, raw_data)
-                            tool_results.append(
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": result,
-                                }
-                            )
+            if finish_reason in ("tool_calls", "function_call") or msg.tool_calls:
+                for tool_call in msg.tool_calls or []:
+                    fn_name = tool_call.function.name
+                    fn_args = json.loads(tool_call.function.arguments or "{}")
+                    console.print(f"  [dim]→ Function call: {fn_name}[/dim]")
 
-                messages.append({"role": "user", "content": tool_results})
+                    if fn_name == "finalize_structured_report":
+                        structured_report_data = fn_args.get("report", {})
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps({
+                                "status": "saved",
+                                "report_id": structured_report_data.get("report_id"),
+                            }),
+                        })
+                        break
+                    else:
+                        result = handle_structurer_tool(fn_name, fn_args, raw_data)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        })
 
                 if structured_report_data is not None:
                     break
 
         if structured_report_data is None:
-            console.print("[yellow]Warning:[/yellow] Claude did not call finalize — building fallback report.")
+            console.print(
+                "[yellow]Warning:[/yellow] Model did not call finalize — building fallback report."
+            )
             structured_report_data = {}
 
         return self._build_structured_report(structured_report_data, raw_data)
@@ -123,7 +145,7 @@ class StructurerAgent:
     def _build_structured_report(
         self, data: dict, raw_data: RawAzureData
     ) -> StructuredReport:
-        """Convert Claude's assembled report dict to a StructuredReport dataclass."""
+        """Convert the assembled report dict to a StructuredReport dataclass."""
         report_id = data.get("report_id") or str(uuid.uuid4())[:8]
 
         cost_by_service = [
