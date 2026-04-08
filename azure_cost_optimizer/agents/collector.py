@@ -26,10 +26,14 @@ from rich.console import Console
 from ..config import Settings
 from ..models.raw_data import (
     AdvisorRecommendation,
+    AiServiceDetail,
+    AnalyticsServiceDetail,
     CostEntry,
+    DataFactoryDetail,
     MetricSample,
     RawAzureData,
     ResourceInfo,
+    SqlResourceDetail,
 )
 
 console = Console()
@@ -89,21 +93,27 @@ class AzureCollector:
         )
         console.print(f"[dim]Scope: {scope_label}[/dim]")
 
-        console.print("[cyan]Step 1/4:[/cyan] Collecting cost data...")
+        console.print("[cyan]Step 1/5:[/cyan] Collecting cost data...")
         cost_entries = self._get_cost_data()
 
-        console.print("[cyan]Step 2/4:[/cyan] Collecting resource inventory...")
+        console.print("[cyan]Step 2/5:[/cyan] Collecting resource inventory...")
         resources = self._get_all_resources()
 
-        console.print("[cyan]Step 3/4:[/cyan] Collecting Azure Advisor recommendations...")
+        console.print("[cyan]Step 3/5:[/cyan] Collecting Azure Advisor recommendations...")
         advisor_recs = self._get_advisor_recommendations()
 
-        console.print("[cyan]Step 4/4:[/cyan] Collecting VM performance metrics...")
+        console.print("[cyan]Step 4/5:[/cyan] Collecting VM performance metrics...")
         vm_resources = [r for r in resources if r.type == "Microsoft.Compute/virtualMachines"]
         vm_metrics = self._get_vm_metrics([r.resource_id for r in vm_resources[:MAX_VMS_FOR_METRICS]])
 
-        orphaned_ids = self._detect_orphaned_resource_ids(resources)
+        console.print("[cyan]Step 5/5:[/cyan] Collecting AI, SQL, ADF, and analytics service details...")
+        cost_by_resource = self._build_cost_by_resource(cost_entries)
+        ai_services = self._collect_ai_services(resources, cost_by_resource)
+        sql_resources = self._collect_sql_resources(resources, cost_by_resource)
+        data_factories = self._collect_data_factories(resources, cost_by_resource)
+        analytics_services = self._collect_analytics_services(resources, cost_by_resource)
 
+        orphaned_ids = self._detect_orphaned_resource_ids(resources)
         total_cost = sum(e.cost_usd for e in cost_entries)
 
         return RawAzureData(
@@ -115,6 +125,10 @@ class AzureCollector:
             advisor_recommendations=advisor_recs,
             vm_metrics=vm_metrics,
             orphaned_resource_ids=orphaned_ids,
+            ai_services=ai_services,
+            sql_resources=sql_resources,
+            data_factories=data_factories,
+            analytics_services=analytics_services,
             total_cost_usd=total_cost,
             resource_count=len(resources),
         )
@@ -411,3 +425,293 @@ class AzureCollector:
 
         console.print(f"  Detected {len(orphaned)} potentially orphaned resources")
         return orphaned
+
+    # -------------------------------------------------------------------------
+    # Helper: cost lookup by resource ID
+    # -------------------------------------------------------------------------
+
+    def _build_cost_by_resource(self, cost_entries: list[CostEntry]) -> dict[str, float]:
+        totals: dict[str, float] = {}
+        for e in cost_entries:
+            if e.resource_id:
+                key = e.resource_id.lower()
+                totals[key] = totals.get(key, 0.0) + e.cost_usd
+        return totals
+
+    # -------------------------------------------------------------------------
+    # AI / Cognitive Services
+    # -------------------------------------------------------------------------
+
+    def _collect_ai_services(
+        self,
+        resources: list[ResourceInfo],
+        cost_by_resource: dict[str, float],
+    ) -> list[AiServiceDetail]:
+        """Collect details for all AI/Cognitive Services resources."""
+        ai_types = {
+            "microsoft.cognitiveservices/accounts",
+            "microsoft.machinelearningservices/workspaces",
+            "microsoft.machinelearningservices/workspaces/onlineendpoints",
+        }
+        ai_resources = [r for r in resources if r.type.lower() in ai_types]
+        details: list[AiServiceDetail] = []
+
+        for r in ai_resources:
+            deployments: list[dict] = []
+
+            # Try to get OpenAI deployments
+            if r.type.lower() == "microsoft.cognitiveservices/accounts":
+                try:
+                    from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
+                    cs_client = CognitiveServicesManagementClient(
+                        self.credential, self.subscription_id
+                    )
+                    account = cs_client.accounts.get(r.resource_group, r.name)
+                    sku_name = account.sku.name if account.sku else "Unknown"
+                    kind = account.kind or "CognitiveServices"
+
+                    # Get deployments for OpenAI accounts
+                    if kind in ("OpenAI", "AIServices"):
+                        try:
+                            for dep in cs_client.deployments.list(r.resource_group, r.name):
+                                deployments.append({
+                                    "name": dep.name,
+                                    "model": dep.properties.model.name if dep.properties and dep.properties.model else "unknown",
+                                    "version": dep.properties.model.version if dep.properties and dep.properties.model else "",
+                                    "capacity_k_tpm": dep.sku.capacity if dep.sku else None,
+                                    "sku": dep.sku.name if dep.sku else None,
+                                })
+                        except Exception:
+                            pass
+                except Exception:
+                    sku_name = "Unknown"
+                    kind = r.type.split("/")[-1]
+            else:
+                sku_name = "Unknown"
+                kind = r.type.split("/")[-1]
+
+            details.append(AiServiceDetail(
+                resource_id=r.resource_id,
+                name=r.name,
+                kind=kind,
+                sku_name=sku_name,
+                resource_group=r.resource_group,
+                location=r.location,
+                monthly_cost_usd=cost_by_resource.get(r.resource_id.lower(), 0.0),
+                deployments=deployments,
+                tags=r.tags,
+            ))
+
+        console.print(f"  Collected {len(details)} AI/Cognitive Services resources")
+        return details
+
+    # -------------------------------------------------------------------------
+    # SQL Resources (Azure SQL, MySQL, PostgreSQL)
+    # -------------------------------------------------------------------------
+
+    def _collect_sql_resources(
+        self,
+        resources: list[ResourceInfo],
+        cost_by_resource: dict[str, float],
+    ) -> list[SqlResourceDetail]:
+        """Collect SQL database details — Azure SQL, MySQL, and PostgreSQL."""
+        sql_type_map = {
+            "microsoft.sql/servers/databases": "AzureSQL",
+            "microsoft.sql/servers/elasticpools": "ElasticPool",
+            "microsoft.sql/managedinstances": "ManagedInstance",
+            "microsoft.dbformysql/servers": "MySQL",
+            "microsoft.dbformysql/flexibleservers": "MySQLFlexible",
+            "microsoft.dbforpostgresql/servers": "PostgreSQL",
+            "microsoft.dbforpostgresql/flexibleservers": "PostgreSQLFlexible",
+        }
+        sql_resources = [
+            r for r in resources if r.type.lower() in sql_type_map
+        ]
+        details: list[SqlResourceDetail] = []
+
+        for r in sql_resources:
+            resource_type = sql_type_map[r.type.lower()]
+            sku_name = None
+            tier = None
+            dtu_or_vcores = None
+            storage_gb = None
+
+            try:
+                from azure.mgmt.sql import SqlManagementClient
+                sql_client = SqlManagementClient(self.credential, self.subscription_id)
+
+                if resource_type == "AzureSQL":
+                    parts = r.name.split("/")
+                    if len(parts) == 2:
+                        db = sql_client.databases.get(r.resource_group, parts[0], parts[1])
+                        if db.sku:
+                            sku_name = db.sku.name
+                            tier = db.sku.tier
+                            dtu_or_vcores = db.sku.capacity
+                        storage_gb = int((db.max_size_bytes or 0) / (1024 ** 3))
+
+                elif resource_type == "ElasticPool":
+                    parts = r.name.split("/")
+                    if len(parts) == 2:
+                        pool = sql_client.elastic_pools.get(r.resource_group, parts[0], parts[1])
+                        if pool.sku:
+                            sku_name = pool.sku.name
+                            tier = pool.sku.tier
+                            dtu_or_vcores = pool.sku.capacity
+
+                elif resource_type == "ManagedInstance":
+                    mi = sql_client.managed_instances.get(r.resource_group, r.name)
+                    sku_name = mi.sku.name if mi.sku else None
+                    tier = mi.sku.tier if mi.sku else None
+                    dtu_or_vcores = mi.v_cores
+                    storage_gb = mi.storage_size_in_gb
+
+            except Exception:
+                pass  # SDK not installed or access denied — use resource info only
+
+            details.append(SqlResourceDetail(
+                resource_id=r.resource_id,
+                name=r.name,
+                resource_type=resource_type,
+                resource_group=r.resource_group,
+                location=r.location,
+                sku_name=sku_name,
+                tier=tier,
+                dtu_or_vcores=dtu_or_vcores,
+                storage_gb=storage_gb,
+                monthly_cost_usd=cost_by_resource.get(r.resource_id.lower(), 0.0),
+                tags=r.tags,
+            ))
+
+        console.print(f"  Collected {len(details)} SQL/database resources")
+        return details
+
+    # -------------------------------------------------------------------------
+    # Azure Data Factory
+    # -------------------------------------------------------------------------
+
+    def _collect_data_factories(
+        self,
+        resources: list[ResourceInfo],
+        cost_by_resource: dict[str, float],
+    ) -> list[DataFactoryDetail]:
+        """Collect ADF factory details including integration runtimes."""
+        adf_resources = [
+            r for r in resources
+            if r.type.lower() == "microsoft.datafactory/factories"
+        ]
+        details: list[DataFactoryDetail] = []
+
+        for r in adf_resources:
+            integration_runtimes: list[dict] = []
+            try:
+                from azure.mgmt.datafactory import DataFactoryManagementClient
+                adf_client = DataFactoryManagementClient(self.credential, self.subscription_id)
+                for ir in adf_client.integration_runtimes.list_by_factory(
+                    r.resource_group, r.name
+                ):
+                    ir_props = ir.properties
+                    integration_runtimes.append({
+                        "name": ir.name,
+                        "type": ir_props.type if ir_props else "Unknown",
+                        "state": ir_props.state if hasattr(ir_props, "state") else None,
+                        "compute_type": (
+                            ir_props.compute_properties.data_flow_properties.compute_type
+                            if hasattr(ir_props, "compute_properties")
+                            and ir_props.compute_properties
+                            and hasattr(ir_props.compute_properties, "data_flow_properties")
+                            and ir_props.compute_properties.data_flow_properties
+                            else None
+                        ),
+                        "core_count": (
+                            ir_props.compute_properties.data_flow_properties.core_count
+                            if hasattr(ir_props, "compute_properties")
+                            and ir_props.compute_properties
+                            and hasattr(ir_props.compute_properties, "data_flow_properties")
+                            and ir_props.compute_properties.data_flow_properties
+                            else None
+                        ),
+                    })
+            except Exception:
+                pass  # SDK not installed or no access
+
+            details.append(DataFactoryDetail(
+                resource_id=r.resource_id,
+                name=r.name,
+                resource_group=r.resource_group,
+                location=r.location,
+                monthly_cost_usd=cost_by_resource.get(r.resource_id.lower(), 0.0),
+                integration_runtimes=integration_runtimes,
+                tags=r.tags,
+            ))
+
+        console.print(f"  Collected {len(details)} Data Factory resources")
+        return details
+
+    # -------------------------------------------------------------------------
+    # Analytics Services (Databricks, Synapse, Fabric, HDInsight)
+    # -------------------------------------------------------------------------
+
+    def _collect_analytics_services(
+        self,
+        resources: list[ResourceInfo],
+        cost_by_resource: dict[str, float],
+    ) -> list[AnalyticsServiceDetail]:
+        """Collect Databricks, Synapse, Fabric, and HDInsight details."""
+        analytics_type_map = {
+            "microsoft.databricks/workspaces": "Databricks",
+            "microsoft.synapse/workspaces": "Synapse",
+            "microsoft.synapse/workspaces/sqlpools": "SynapseSQLPool",
+            "microsoft.synapse/workspaces/bigdatapools": "SynapseSparkPool",
+            "microsoft.fabric/capacities": "Fabric",
+            "microsoft.hdinsight/clusters": "HDInsight",
+        }
+        analytics_resources = [
+            r for r in resources if r.type.lower() in analytics_type_map
+        ]
+        details: list[AnalyticsServiceDetail] = []
+
+        for r in analytics_resources:
+            resource_type = analytics_type_map[r.type.lower()]
+            sku_name = None
+            props: dict = {}
+
+            # Try Synapse SQL pool details
+            if resource_type == "SynapseSQLPool":
+                try:
+                    from azure.mgmt.synapse import SynapseManagementClient
+                    syn_client = SynapseManagementClient(self.credential, self.subscription_id)
+                    parts = r.name.split("/")
+                    if len(parts) == 2:
+                        pool = syn_client.sql_pools.get(r.resource_group, parts[0], parts[1])
+                        sku_name = pool.sku.name if pool.sku else None
+                        props = {
+                            "status": pool.status,
+                            "dw_units": pool.sku.capacity if pool.sku else None,
+                        }
+                except Exception:
+                    pass
+
+            # Try Fabric capacity SKU
+            elif resource_type == "Fabric":
+                try:
+                    # Fabric uses the resource properties from resource manager
+                    props = {"sku": r.properties.get("sku", {}).get("name")}
+                    sku_name = props.get("sku")
+                except Exception:
+                    pass
+
+            details.append(AnalyticsServiceDetail(
+                resource_id=r.resource_id,
+                name=r.name,
+                resource_type=resource_type,
+                resource_group=r.resource_group,
+                location=r.location,
+                sku_name=sku_name,
+                monthly_cost_usd=cost_by_resource.get(r.resource_id.lower(), 0.0),
+                properties=props,
+                tags=r.tags,
+            ))
+
+        console.print(f"  Collected {len(details)} analytics service resources")
+        return details

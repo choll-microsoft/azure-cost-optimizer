@@ -59,6 +59,58 @@ class MetricSample:
 
 
 @dataclass
+class AiServiceDetail:
+    resource_id: str
+    name: str
+    kind: str           # "OpenAI", "CognitiveServices", "AIServices", "ContentSafety", etc.
+    sku_name: str       # "S0", "S1", "F0", "Standard", etc.
+    resource_group: str
+    location: str
+    monthly_cost_usd: float = 0.0
+    deployments: list[dict] = field(default_factory=list)   # model name + capacity
+    tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class SqlResourceDetail:
+    resource_id: str
+    name: str
+    resource_type: str  # "AzureSQL", "ManagedInstance", "ElasticPool", "MySQL", "PostgreSQL"
+    resource_group: str
+    location: str
+    sku_name: str | None = None
+    tier: str | None = None         # "Standard", "Premium", "GeneralPurpose", etc.
+    dtu_or_vcores: int | None = None
+    storage_gb: int | None = None
+    monthly_cost_usd: float = 0.0
+    tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class DataFactoryDetail:
+    resource_id: str
+    name: str
+    resource_group: str
+    location: str
+    monthly_cost_usd: float = 0.0
+    integration_runtimes: list[dict] = field(default_factory=list)  # name, type, cores
+    tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class AnalyticsServiceDetail:
+    resource_id: str
+    name: str
+    resource_type: str  # "Databricks", "Synapse", "Fabric", "HDInsight"
+    resource_group: str
+    location: str
+    sku_name: str | None = None
+    monthly_cost_usd: float = 0.0
+    properties: dict[str, Any] = field(default_factory=dict)
+    tags: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class RawAzureData:
     collected_at: datetime
     subscription_id: str
@@ -68,5 +120,10 @@ class RawAzureData:
     advisor_recommendations: list[AdvisorRecommendation] = field(default_factory=list)
     vm_metrics: list[MetricSample] = field(default_factory=list)
     orphaned_resource_ids: list[str] = field(default_factory=list)
+    # Extended service details
+    ai_services: list[AiServiceDetail] = field(default_factory=list)
+    sql_resources: list[SqlResourceDetail] = field(default_factory=list)
+    data_factories: list[DataFactoryDetail] = field(default_factory=list)
+    analytics_services: list[AnalyticsServiceDetail] = field(default_factory=list)
     total_cost_usd: float = 0.0
     resource_count: int = 0

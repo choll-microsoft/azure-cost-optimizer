@@ -23,8 +23,15 @@ Focus areas (in priority order):
 2. Right-sizing: VMs running at <20% CPU for 30+ days
 3. Reservations: VMs running 24/7 that are not reserved
 4. Azure Savings Plans: broad compute spend commitments
-5. Cost anomalies: unexplained spend spikes
-6. Performance tracking: identify over-provisioned and at-capacity resources
+5. AI model costs: GPT-4o → GPT-4o-mini for suitable workloads, over-provisioned deployments
+6. Data Factory: idle integration runtimes, compute type optimization
+7. Databricks: spot instances, auto-termination, job vs all-purpose clusters
+8. Synapse & Fabric: dedicated SQL pool auto-pause, DWU right-sizing, SKU optimization
+9. SQL migration: Azure SQL → PostgreSQL or MySQL (50-70% cheaper for eligible workloads)
+10. Cost anomalies: unexplained spend spikes
+
+Always call ALL relevant analysis tools before calling finalize_optimization_report.
+Even if a service has zero cost today, call the tool — it may reveal architectural recommendations.
 
 For each recommendation:
 - Be specific (name the actual resources when possible)
