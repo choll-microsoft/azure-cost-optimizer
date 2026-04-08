@@ -38,8 +38,9 @@ class CostOptimizerPipeline:
         self,
         subscription_id: str | None = None,
         resource_group: str | None = None,
+        tenant_id: str | None = None,
     ):
-        self.credential = get_credential()
+        self.credential = get_credential(tenant_id=tenant_id)
         self.collector = AzureCollector(
             self.credential,
             settings,

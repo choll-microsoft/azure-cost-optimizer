@@ -38,6 +38,8 @@ Examples:
     )
     parser.add_argument("--days", type=int, default=None,
                         help="Lookback period in days (default: 30)")
+    parser.add_argument("--tenant-id", type=str, default=None,
+                        help="Azure tenant ID (uses registered credentials)")
     parser.add_argument("--subscription-id", type=str, default=None,
                         help="Azure subscription ID to analyze")
     parser.add_argument("--resource-group", type=str, default=None,
@@ -62,6 +64,7 @@ Examples:
             os.environ["LOOKBACK_DAYS"] = str(args.days)
 
         pipeline = CostOptimizerPipeline(
+            tenant_id=args.tenant_id,
             subscription_id=args.subscription_id,
             resource_group=args.resource_group,
         )

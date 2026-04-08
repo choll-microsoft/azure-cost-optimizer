@@ -46,7 +46,7 @@ CATEGORY_COLORS = {
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_azure_subscriptions() -> list[dict]:
-    """Return all subscriptions the current az CLI user can access."""
+    """Return all subscriptions visible to the current az CLI session."""
     try:
         result = subprocess.run(
             ["az", "account", "list", "--query",
@@ -71,6 +71,30 @@ def load_resource_groups(subscription_id: str) -> list[str]:
         )
         if result.returncode == 0:
             return sorted(json.loads(result.stdout))
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=300)
+def load_subscriptions_for_sp(tenant_id: str, client_id: str, client_secret: str) -> list[dict]:
+    """Return subscriptions accessible with the given service principal credentials."""
+    try:
+        result = subprocess.run(
+            ["az", "account", "list",
+             "--query", "[?state=='Enabled'].{name:name,id:id,tenantId:tenantId}",
+             "-o", "json"],
+            capture_output=True, text=True, timeout=30,
+            env={
+                **__import__("os").environ,
+                "AZURE_TENANT_ID": tenant_id,
+                "AZURE_CLIENT_ID": client_id,
+                "AZURE_CLIENT_SECRET": client_secret,
+            },
+        )
+        if result.returncode == 0:
+            subs = json.loads(result.stdout)
+            return [s for s in subs if s["tenantId"] == tenant_id]
     except Exception:
         pass
     return []
@@ -136,61 +160,194 @@ with st.sidebar:
     st.caption("Multi-agent analysis powered by Azure OpenAI GPT-4o")
     st.divider()
 
+    # ── Tenant Management ─────────────────────
+    st.subheader("🏢 Tenants")
+
+    from azure_cost_optimizer.tenant_registry import (
+        add_cli_tenant, add_sp_tenant, list_tenants, remove_tenant,
+    )
+
+    # Collect all known tenants: CLI-visible + registered
+    cli_subs = load_azure_subscriptions()
+    cli_tenants: dict[str, list[dict]] = {}
+    for sub in cli_subs:
+        cli_tenants.setdefault(sub["tenantId"], []).append(sub)
+
+    registered = {t["tenant_id"]: t for t in list_tenants()}
+
+    # Merge: CLI tenants + registered-only tenants
+    all_tenant_ids: list[str] = sorted(
+        set(cli_tenants.keys()) | set(registered.keys())
+    )
+
+    # Auto-register CLI tenants on first encounter
+    for tid in cli_tenants:
+        if not (Path("config/tenants.json").exists() and tid in registered):
+            # Build display name from first subscription name
+            sub_name = cli_tenants[tid][0]["name"] if cli_tenants[tid] else tid[:8]
+            add_cli_tenant(tid, f"{sub_name[:30]}… (CLI)")
+            registered = {t["tenant_id"]: t for t in list_tenants()}
+
+    # ── Add Tenant form ───────────────────────
+    with st.expander("➕ Add Tenant", expanded=len(all_tenant_ids) == 0):
+        add_method = st.radio(
+            "Authentication method",
+            ["🌐 Browser / az login", "🔑 Service Principal"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        if add_method == "🌐 Browser / az login":
+            st.caption(
+                "Opens a browser window to authenticate with the new tenant. "
+                "Credentials are managed by the Azure CLI — no secrets stored here."
+            )
+            new_tenant_id = st.text_input(
+                "Tenant ID",
+                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                key="cli_tenant_id",
+            )
+            new_tenant_name = st.text_input(
+                "Display name (optional)",
+                placeholder="Contoso Production",
+                key="cli_tenant_name",
+            )
+            if st.button("🔐 Login with Browser", use_container_width=True,
+                         disabled=not new_tenant_id):
+                with st.spinner(f"Opening browser for tenant {new_tenant_id}…"):
+                    result = subprocess.run(
+                        ["az", "login", "--tenant", new_tenant_id, "--use-device-code"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                if result.returncode == 0:
+                    display_name = new_tenant_name or new_tenant_id[:8] + "… (CLI)"
+                    add_cli_tenant(new_tenant_id, display_name)
+                    st.success(f"Tenant {display_name} added!")
+                    load_azure_subscriptions.clear()
+                    st.rerun()
+                else:
+                    st.error("Login failed")
+                    st.code(result.stderr[-1000:])
+
+        else:  # Service Principal
+            st.caption(
+                "Credentials are stored **locally only** in `config/tenants.json` "
+                "(gitignored). Never committed to the repository."
+            )
+            sp_tenant = st.text_input("Tenant ID *", key="sp_tenant_id",
+                                       placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            sp_name = st.text_input("Display name", key="sp_name",
+                                     placeholder="Contoso Production")
+            sp_client_id = st.text_input("Client ID (App ID) *", key="sp_client_id")
+            sp_secret = st.text_input("Client Secret *", key="sp_secret",
+                                       type="password")
+
+            if st.button("💾 Save Service Principal", use_container_width=True,
+                         disabled=not (sp_tenant and sp_client_id and sp_secret)):
+                # Validate credentials
+                with st.spinner("Validating credentials…"):
+                    test = subprocess.run(
+                        ["az", "account", "list", "-o", "json"],
+                        capture_output=True, text=True, timeout=30,
+                        env={
+                            **__import__("os").environ,
+                            "AZURE_TENANT_ID": sp_tenant,
+                            "AZURE_CLIENT_ID": sp_client_id,
+                            "AZURE_CLIENT_SECRET": sp_secret,
+                        },
+                    )
+                add_sp_tenant(
+                    tenant_id=sp_tenant,
+                    display_name=sp_name or sp_tenant[:8] + "… (SP)",
+                    client_id=sp_client_id,
+                    client_secret=sp_secret,
+                )
+                st.success("Service principal saved!")
+                st.rerun()
+
+    # ── Registered Tenant List ────────────────
+    registered_now = {t["tenant_id"]: t for t in list_tenants()}
+    if registered_now:
+        for tid, cfg in registered_now.items():
+            col_name, col_badge, col_del = st.columns([3, 1, 1])
+            col_name.markdown(
+                f"**{cfg['display_name']}**  \n"
+                f"<small>`{tid[:8]}…`</small>",
+                unsafe_allow_html=True,
+            )
+            col_badge.markdown(
+                f"<span style='font-size:11px;color:gray'>"
+                f"{'🌐 CLI' if cfg['auth_method'] == 'cli' else '🔑 SP'}</span>",
+                unsafe_allow_html=True,
+            )
+            if col_del.button("✕", key=f"del_{tid}", help=f"Remove {cfg['display_name']}"):
+                remove_tenant(tid)
+                st.rerun()
+
+    st.divider()
+
     # ── Scope Selection ──────────────────────
     st.subheader("🎯 Analysis Scope")
 
-    subscriptions = load_azure_subscriptions()
+    all_tenant_ids = sorted(set(cli_tenants.keys()) | set(registered_now.keys()))
 
     selected_sub_id: str | None = None
     selected_rg: str | None = None
+    chosen_tenant: str | None = None
 
-    if subscriptions:
-        # Group by tenant
-        tenants: dict[str, list[dict]] = {}
-        for sub in subscriptions:
-            tenants.setdefault(sub["tenantId"], []).append(sub)
-
-        tenant_ids = sorted(tenants.keys())
-        tenant_labels = {t: f"{t[:8]}… ({len(tenants[t])} subscriptions)" for t in tenant_ids}
+    if all_tenant_ids:
+        tenant_label_map = {
+            tid: registered_now.get(tid, {}).get("display_name", tid[:8] + "…")
+            for tid in all_tenant_ids
+        }
 
         chosen_tenant = st.selectbox(
             "Tenant",
-            options=tenant_ids,
-            format_func=lambda t: tenant_labels[t],
-            help="Azure Active Directory tenant",
+            options=all_tenant_ids,
+            format_func=lambda t: tenant_label_map[t],
+            help="Select which tenant to analyze",
         )
 
-        tenant_subs = tenants[chosen_tenant]
-        sub_options = {s["id"]: f"{s['name']}" for s in tenant_subs}
+        # Subscriptions for this tenant
+        if chosen_tenant in cli_tenants:
+            tenant_subs = cli_tenants[chosen_tenant]
+        else:
+            # SP tenant — query via the registry credential
+            cfg = registered_now.get(chosen_tenant, {})
+            if cfg.get("auth_method") == "sp":
+                with st.spinner("Loading subscriptions…"):
+                    tenant_subs = load_azure_subscriptions()
+                    tenant_subs = [s for s in tenant_subs if s["tenantId"] == chosen_tenant]
+            else:
+                tenant_subs = []
 
-        chosen_sub_id = st.selectbox(
-            "Subscription",
-            options=list(sub_options.keys()),
-            format_func=lambda sid: sub_options[sid],
-            help="Azure subscription to analyze",
-        )
-        selected_sub_id = chosen_sub_id
+        sub_options = {s["id"]: s["name"] for s in tenant_subs}
 
-        # Resource group (optional)
-        with st.spinner("Loading resource groups…"):
-            rg_list = load_resource_groups(chosen_sub_id)
+        if sub_options:
+            chosen_sub_id = st.selectbox(
+                "Subscription",
+                options=list(sub_options.keys()),
+                format_func=lambda sid: sub_options[sid],
+            )
+            selected_sub_id = chosen_sub_id
 
-        rg_options = ["— All resource groups —"] + rg_list
-        chosen_rg = st.selectbox(
-            "Resource Group",
-            options=rg_options,
-            help="Narrow analysis to a single resource group (optional)",
-        )
-        if chosen_rg != "— All resource groups —":
-            selected_rg = chosen_rg
+            # Resource groups
+            with st.spinner("Loading resource groups…"):
+                rg_list = load_resource_groups(chosen_sub_id)
+            rg_options = ["— All resource groups —"] + rg_list
+            chosen_rg = st.selectbox("Resource Group", rg_options)
+            if chosen_rg != "— All resource groups —":
+                selected_rg = chosen_rg
 
-        # Scope badge
-        scope_parts = [sub_options[chosen_sub_id]]
-        if selected_rg:
-            scope_parts.append(f"/{selected_rg}")
-        st.info(f"**Scope:** {' '.join(scope_parts)}", icon="📍")
+            # Scope badge
+            badge = sub_options[chosen_sub_id]
+            if selected_rg:
+                badge += f" / {selected_rg}"
+            st.info(f"📍 **Scope:** {badge}")
+        else:
+            st.warning("No subscriptions found for this tenant.")
     else:
-        st.warning("Could not load Azure subscriptions. Is `az login` active?")
+        st.warning("No tenants configured. Add one above or run `az login`.")
 
     st.divider()
 
@@ -246,6 +403,8 @@ with st.sidebar:
         cmd = [sys.executable, "main.py",
                "--subscription-id", selected_sub_id,
                "--days", str(lookback)]
+        if chosen_tenant:
+            cmd += ["--tenant-id", chosen_tenant]
         if selected_rg:
             cmd += ["--resource-group", selected_rg]
 
