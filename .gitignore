@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+outputs/raw/*.json
+outputs/reports/*.json
+outputs/recommendations/*.json
+outputs/recommendations/*.md
