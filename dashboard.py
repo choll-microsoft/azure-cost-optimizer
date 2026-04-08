@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import plotly.graph_objects as go  # noqa: F401
 import streamlit as st
 
 # ─────────────────────────────────────────────
@@ -42,7 +42,42 @@ CATEGORY_COLORS = {
 
 
 # ─────────────────────────────────────────────
-# Data loaders
+# Azure scope loaders (via az CLI)
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_azure_subscriptions() -> list[dict]:
+    """Return all subscriptions the current az CLI user can access."""
+    try:
+        result = subprocess.run(
+            ["az", "account", "list", "--query",
+             "[?state=='Enabled'].{name:name,id:id,tenantId:tenantId}", "-o", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except Exception:
+        pass
+    return []
+
+
+@st.cache_data(ttl=300)
+def load_resource_groups(subscription_id: str) -> list[str]:
+    """Return resource groups for the given subscription."""
+    try:
+        result = subprocess.run(
+            ["az", "group", "list", "--subscription", subscription_id,
+             "--query", "[].name", "-o", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return sorted(json.loads(result.stdout))
+    except Exception:
+        pass
+    return []
+
+
+# ─────────────────────────────────────────────
+# Output file loaders
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=60)
 def list_raw_files() -> list[Path]:
@@ -98,24 +133,83 @@ with st.sidebar:
         width=160,
     )
     st.title("Azure Cost Optimizer")
-    st.caption("Multi-agent analysis powered by Claude")
+    st.caption("Multi-agent analysis powered by Azure OpenAI GPT-4o")
     st.divider()
 
+    # ── Scope Selection ──────────────────────
+    st.subheader("🎯 Analysis Scope")
+
+    subscriptions = load_azure_subscriptions()
+
+    selected_sub_id: str | None = None
+    selected_rg: str | None = None
+
+    if subscriptions:
+        # Group by tenant
+        tenants: dict[str, list[dict]] = {}
+        for sub in subscriptions:
+            tenants.setdefault(sub["tenantId"], []).append(sub)
+
+        tenant_ids = sorted(tenants.keys())
+        tenant_labels = {t: f"{t[:8]}… ({len(tenants[t])} subscriptions)" for t in tenant_ids}
+
+        chosen_tenant = st.selectbox(
+            "Tenant",
+            options=tenant_ids,
+            format_func=lambda t: tenant_labels[t],
+            help="Azure Active Directory tenant",
+        )
+
+        tenant_subs = tenants[chosen_tenant]
+        sub_options = {s["id"]: f"{s['name']}" for s in tenant_subs}
+
+        chosen_sub_id = st.selectbox(
+            "Subscription",
+            options=list(sub_options.keys()),
+            format_func=lambda sid: sub_options[sid],
+            help="Azure subscription to analyze",
+        )
+        selected_sub_id = chosen_sub_id
+
+        # Resource group (optional)
+        with st.spinner("Loading resource groups…"):
+            rg_list = load_resource_groups(chosen_sub_id)
+
+        rg_options = ["— All resource groups —"] + rg_list
+        chosen_rg = st.selectbox(
+            "Resource Group",
+            options=rg_options,
+            help="Narrow analysis to a single resource group (optional)",
+        )
+        if chosen_rg != "— All resource groups —":
+            selected_rg = chosen_rg
+
+        # Scope badge
+        scope_parts = [sub_options[chosen_sub_id]]
+        if selected_rg:
+            scope_parts.append(f"/{selected_rg}")
+        st.info(f"**Scope:** {' '.join(scope_parts)}", icon="📍")
+    else:
+        st.warning("Could not load Azure subscriptions. Is `az login` active?")
+
+    st.divider()
+
+    # ── Saved Reports ────────────────────────
+    st.subheader("📁 Saved Reports")
     raw_files = list_raw_files()
     opt_files = list_optimization_files()
 
-    # File selectors
     selected_raw = None
     if raw_files:
         raw_labels = {f.name: str(f) for f in raw_files}
         chosen_raw_label = st.selectbox(
             "Raw data snapshot",
             options=list(raw_labels.keys()),
-            help="Select a collected Azure snapshot",
+            help="Previously collected Azure data",
         )
         selected_raw = raw_labels[chosen_raw_label]
     else:
-        st.warning("No raw data found. Run the collector first.")
+        st.caption("No snapshots yet — run the pipeline below.")
 
     selected_opt = None
     if opt_files:
@@ -123,29 +217,41 @@ with st.sidebar:
         chosen_opt_label = st.selectbox(
             "Optimization report",
             options=list(opt_labels.keys()),
-            help="Select a Claude optimization report",
+            help="GPT-4o optimization report",
         )
         selected_opt = opt_labels[chosen_opt_label]
     else:
-        st.info("No optimization report yet. Run the full pipeline to generate one.")
+        st.caption("No optimization report yet.")
 
     st.divider()
 
-    # Run pipeline button
-    st.subheader("Run Analysis")
-    run_col1, run_col2 = st.columns(2)
-    run_collect = run_col1.button("Full Pipeline", type="primary", use_container_width=True,
-                                   help="Collect fresh Azure data + run Claude agents")
-    run_agents = run_col2.button("Agents Only", use_container_width=True,
-                                  help="Re-run Claude agents on existing raw data (faster)",
-                                  disabled=selected_raw is None)
+    # ── Run Pipeline ─────────────────────────
+    st.subheader("▶️ Run Analysis")
 
-    if run_collect:
-        with st.spinner("Running full pipeline (this takes a few minutes)…"):
-            result = subprocess.run(
-                [sys.executable, "main.py"],
-                capture_output=True, text=True, cwd="."
-            )
+    lookback = st.slider("Lookback days", 7, 90, 30)
+
+    run_col1, run_col2 = st.columns(2)
+    run_collect = run_col1.button(
+        "Full Pipeline", type="primary", use_container_width=True,
+        help="Collect fresh Azure data then run GPT-4o agents",
+        disabled=selected_sub_id is None,
+    )
+    run_agents = run_col2.button(
+        "Agents Only", use_container_width=True,
+        help="Re-run GPT-4o agents on existing snapshot",
+        disabled=selected_raw is None,
+    )
+
+    if run_collect and selected_sub_id:
+        cmd = [sys.executable, "main.py",
+               "--subscription-id", selected_sub_id,
+               "--days", str(lookback)]
+        if selected_rg:
+            cmd += ["--resource-group", selected_rg]
+
+        scope_display = selected_rg or sub_options.get(selected_sub_id, selected_sub_id)
+        with st.spinner(f"Collecting data for {scope_display}…"):
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=".")
         if result.returncode == 0:
             st.success("Pipeline complete!")
             st.cache_data.clear()
@@ -155,7 +261,7 @@ with st.sidebar:
             st.code(result.stderr[-3000:])
 
     if run_agents and selected_raw:
-        with st.spinner("Running Claude agents on existing data…"):
+        with st.spinner("Running GPT-4o agents on existing snapshot…"):
             result = subprocess.run(
                 [sys.executable, "main.py", "--raw-file", selected_raw],
                 capture_output=True, text=True, cwd="."
@@ -169,7 +275,7 @@ with st.sidebar:
             st.code(result.stderr[-3000:])
 
     st.divider()
-    st.caption("Data refreshes automatically every 60s")
+    st.caption("Subscription list refreshes every 5 min · Reports every 60s")
 
 
 # ─────────────────────────────────────────────
@@ -211,8 +317,10 @@ tab_overview, tab_costs, tab_resources, tab_advisor, tab_optimization = st.tabs(
 # ═══════════════════════════════════════════
 with tab_overview:
     st.header("Subscription Overview")
+    rg_label = f" · Resource Group: `{raw.get('resource_group', selected_rg)}`" if selected_rg else ""
     st.caption(
-        f"Subscription `{sub_id}` · Snapshot: {collected_at.strftime('%Y-%m-%d %H:%M UTC')} · "
+        f"Subscription `{sub_id}`{rg_label} · "
+        f"Snapshot: {collected_at.strftime('%Y-%m-%d %H:%M UTC')} · "
         f"Period: last {lookback} days"
     )
 

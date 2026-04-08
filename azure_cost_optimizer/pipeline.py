@@ -34,9 +34,18 @@ def _to_dict(obj):
 class CostOptimizerPipeline:
     """Orchestrates the three-agent Azure cost optimization pipeline."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        subscription_id: str | None = None,
+        resource_group: str | None = None,
+    ):
         self.credential = get_credential()
-        self.collector = AzureCollector(self.credential, settings)
+        self.collector = AzureCollector(
+            self.credential,
+            settings,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+        )
         self.structurer = StructurerAgent()
         self.optimizer = OptimizerAgent()
         self.output_dir = Path(settings.output_dir)

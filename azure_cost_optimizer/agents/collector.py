@@ -52,11 +52,26 @@ VM_METRIC_BATCH_SIZE = 10
 class AzureCollector:
     """Collects cost, resource, advisor, and metric data from Azure APIs."""
 
-    def __init__(self, credential: ClientSecretCredential, settings: Settings):
+    def __init__(
+        self,
+        credential: ClientSecretCredential,
+        settings: Settings,
+        subscription_id: str | None = None,
+        resource_group: str | None = None,
+    ):
         self.credential = credential
-        self.subscription_id = settings.azure_subscription_id
+        self.subscription_id = subscription_id or settings.azure_subscription_id
+        self.resource_group = resource_group  # None = subscription-wide
         self.lookback_days = settings.lookback_days
-        self._scope = f"/subscriptions/{self.subscription_id}"
+
+        # Cost Management scope: subscription or resource group level
+        if resource_group:
+            self._scope = (
+                f"/subscriptions/{self.subscription_id}"
+                f"/resourceGroups/{resource_group}"
+            )
+        else:
+            self._scope = f"/subscriptions/{self.subscription_id}"
 
         self.cost_client = CostManagementClient(credential)
         self.resource_client = ResourceManagementClient(credential, self.subscription_id)
@@ -68,6 +83,12 @@ class AzureCollector:
     def collect_all(self) -> RawAzureData:
         """Run all collectors and assemble RawAzureData."""
         now = datetime.now(timezone.utc)
+        scope_label = (
+            f"resource group '{self.resource_group}'" if self.resource_group
+            else f"subscription '{self.subscription_id}'"
+        )
+        console.print(f"[dim]Scope: {scope_label}[/dim]")
+
         console.print("[cyan]Step 1/4:[/cyan] Collecting cost data...")
         cost_entries = self._get_cost_data()
 
@@ -171,7 +192,15 @@ class AzureCollector:
         resources: list[ResourceInfo] = []
 
         try:
-            for item in self.resource_client.resources.list():
+            # Scope to a specific resource group when selected
+            if self.resource_group:
+                iterator = self.resource_client.resources.list_by_resource_group(
+                    self.resource_group
+                )
+            else:
+                iterator = self.resource_client.resources.list()
+
+            for item in iterator:
                 rg = ""
                 if item.id:
                     parts = item.id.split("/")
@@ -239,11 +268,21 @@ class AzureCollector:
     # -------------------------------------------------------------------------
 
     def _get_advisor_recommendations(self) -> list[AdvisorRecommendation]:
-        """Fetch all Advisor recommendations for the subscription."""
+        """Fetch Advisor recommendations, filtered to resource group when scoped."""
         recommendations: list[AdvisorRecommendation] = []
 
         try:
-            for rec in self.advisor_client.recommendations.list():
+            all_recs = self.advisor_client.recommendations.list()
+            # Filter to resource group when scoped
+            if self.resource_group:
+                rg_lower = self.resource_group.lower()
+                all_recs = (
+                    r for r in all_recs
+                    if r.resource_metadata
+                    and r.resource_metadata.resource_id
+                    and f"/resourcegroups/{rg_lower}/" in r.resource_metadata.resource_id.lower()
+                )
+            for rec in all_recs:
                 savings_usd: float | None = None
                 savings_currency: str | None = None
 

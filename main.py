@@ -16,52 +16,55 @@ console = Console()
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Azure Cost Optimizer: collect, structure, and optimize Azure costs using Claude.",
+        description="Azure Cost Optimizer: collect, structure, and optimize Azure costs using GPT-4o.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full pipeline (collect → structure → optimize)
+  # Full pipeline — subscription scope (default from .env)
   python main.py
 
-  # Use cached raw data (skip Azure API calls)
+  # Target a specific subscription
+  python main.py --subscription-id <sub-id>
+
+  # Scope to a single resource group
+  python main.py --subscription-id <sub-id> --resource-group my-rg
+
+  # Re-run agents on cached data (skip collection)
   python main.py --raw-file outputs/raw/raw_20240101_120000.json
 
-  # Analyze last 14 days instead of default 30
+  # Analyze last 14 days
   python main.py --days 14
         """,
     )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help="Lookback period in days (default: from LOOKBACK_DAYS env var or 30)",
-    )
-    parser.add_argument(
-        "--raw-file",
-        type=str,
-        default=None,
-        help="Path to existing raw data JSON file (skips Azure data collection)",
-    )
+    parser.add_argument("--days", type=int, default=None,
+                        help="Lookback period in days (default: 30)")
+    parser.add_argument("--subscription-id", type=str, default=None,
+                        help="Azure subscription ID to analyze")
+    parser.add_argument("--resource-group", type=str, default=None,
+                        help="Scope analysis to a single resource group")
+    parser.add_argument("--raw-file", type=str, default=None,
+                        help="Path to existing raw data JSON (skips collection)")
     args = parser.parse_args()
 
     console.print(
         Panel.fit(
             "[bold blue]Azure Cost Optimizer[/bold blue]\n"
-            "Multi-agent cost analysis powered by Claude",
+            "Multi-agent cost analysis powered by Azure OpenAI GPT-4o",
             border_style="blue",
         )
     )
 
     try:
-        # Import here so dotenv is loaded first
         from azure_cost_optimizer.pipeline import CostOptimizerPipeline
 
-        # Override lookback_days if specified
         if args.days is not None:
             import os
             os.environ["LOOKBACK_DAYS"] = str(args.days)
 
-        pipeline = CostOptimizerPipeline()
+        pipeline = CostOptimizerPipeline(
+            subscription_id=args.subscription_id,
+            resource_group=args.resource_group,
+        )
 
         raw_data = None
         if args.raw_file:
@@ -87,10 +90,8 @@ Examples:
             console.print("\n[bold]Top 3 Recommendations:[/bold]")
             for i, rec in enumerate(optimization.recommendations[:3], 1):
                 priority_colors = {
-                    "critical": "red",
-                    "high": "orange3",
-                    "medium": "yellow",
-                    "low": "green",
+                    "critical": "red", "high": "orange3",
+                    "medium": "yellow", "low": "green",
                 }
                 color = priority_colors.get(rec.priority, "white")
                 console.print(
@@ -105,7 +106,6 @@ Examples:
         return 1
     except Exception as e:
         console.print(f"\n[red]Error:[/red] {e}")
-        import traceback
         console.print_exception()
         return 1
 
